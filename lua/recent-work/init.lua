@@ -15,6 +15,9 @@ local default_config = {
 		".venv",
 		"venv",
 	},
+	batch_size_dirs = vim.loop.available_parallelism() or 8, -- Process directories in batches during scanning for better performance
+	max_commits_per_repo = 200, -- Limit commits per repository for faster processing
+	parallel_git_jobs = vim.loop.available_parallelism() or 5, -- Number of git operations to run in parallel
 }
 
 M.config = vim.deepcopy(default_config)
@@ -24,6 +27,85 @@ function M.setup(user_config)
 	M.config = vim.tbl_deep_extend("force", default_config, user_config)
 end
 
+local function find_git_repos_async(directory, max_depth, current_depth)
+	return coroutine.create(function()
+		current_depth = current_depth or 0
+		local git_repos = {}
+
+		if current_depth >= max_depth then
+			return git_repos
+		end
+
+		-- Quick check if this directory is a git repo
+		local git_dir = directory .. "/.git"
+		if vim.fn.isdirectory(git_dir) == 1 then
+			table.insert(git_repos, directory)
+			return git_repos
+		end
+
+		-- Get all subdirectories first
+		local subdirs = {}
+		local handle = vim.loop.fs_scandir(directory)
+		if handle then
+			while true do
+				local name, type = vim.loop.fs_scandir_next(handle)
+				if not name then
+					break
+				end
+
+				if type == "directory" then
+					local should_ignore = false
+					for _, pattern in ipairs(M.config.ignore_patterns) do
+						if name:match(pattern) then
+							should_ignore = true
+							break
+						end
+					end
+
+					if not should_ignore then
+						table.insert(subdirs, directory .. "/" .. name)
+					end
+				end
+			end
+		end
+
+		-- Process subdirectories in batches using coroutines
+		local batch_size = M.config.batch_size_dirs
+		for i = 1, #subdirs, batch_size do
+			local batch_end = math.min(i + batch_size - 1, #subdirs)
+			local batch_coroutines = {}
+
+			-- Create coroutines for current batch
+			for j = i, batch_end do
+				table.insert(batch_coroutines, {
+					dir = subdirs[j],
+					coroutine = find_git_repos_async(subdirs[j], max_depth, current_depth + 1),
+				})
+			end
+
+			-- Process current batch
+			for _, batch_item in ipairs(batch_coroutines) do
+				local co_success, subrepos = coroutine.resume(batch_item.coroutine)
+				if co_success and subrepos then
+					for _, repo in ipairs(subrepos) do
+						table.insert(git_repos, repo)
+					end
+				elseif not co_success then
+					print("Error scanning directory " .. batch_item.dir .. ": " .. tostring(subrepos))
+				end
+			end
+
+			-- Yield after each batch to keep Neovim responsive
+			if batch_end < #subdirs then
+				coroutine.yield()
+			end
+		end
+
+		return git_repos
+	end)
+end
+
+-- Legacy synchronous version for fallback
 local function find_git_repos(directory, max_depth, current_depth)
 	current_depth = current_depth or 0
 	local git_repos = {}
@@ -104,101 +186,124 @@ local function matches_author_filter(author, filter)
 	end
 end
 
-local function get_local_branches(repo_path)
-	local cmd = string.format("cd '%s' && git branch --format='%%(refname:short)'", repo_path)
-	local handle = io.popen(cmd)
-	if not handle then
-		print("Failed to list local branches within directory: " .. repo_path)
-		return
-	end
-	local result = handle:read("*all")
-	handle:close()
-
-	local branches = {}
-	for branch in result:gmatch("[^\r\n]+") do
-		if branch and branch ~= "" then
-			table.insert(branches, vim.trim(branch))
-		end
-	end
-
-	return branches
-end
-
-local function get_recent_commits_from_branch(repo_path, branch, days_back)
+-- Simple but effective parallel approach using background processes
+local function execute_parallel_git_commands(repo_batch, days_back, author_filter)
 	local since_date = os.date("%Y-%m-%d", os.time() - (days_back * 24 * 60 * 60))
-	local cmd = string.format(
-		"cd '%s' && git log %s --since='%s' --pretty=format:'%%h|%%an|%%ad|%%s' --date=short",
-		repo_path,
-		branch,
-		since_date
-	)
+	local temp_files = {}
+	local commands = {}
 
-	local handle = io.popen(cmd)
-	if not handle then
-		print("Failed to get recent commits from branch: " .. branch .. " in project: " .. repo_path)
-		return
+	-- Create temporary files and commands for each repo
+	for i, repo in ipairs(repo_batch) do
+		local temp_file = vim.fn.tempname()
+		table.insert(temp_files, temp_file)
+
+		local git_cmd = string.format(
+			"cd '%s' && git log --all --since='%s' --max-count=%d --pretty=format:'%%h|%%an|%%ad|%%s|%%D' --date=short > '%s' 2>/dev/null &",
+			repo,
+			since_date,
+			M.config.max_commits_per_repo,
+			temp_file
+		)
+		table.insert(commands, git_cmd)
 	end
-	local result = handle:read("*all")
-	handle:close()
 
-	local commits = {}
-	for line in result:gmatch("[^\r\n]+") do
-		if line and line ~= "" then
-			local hash, author, date, message = line:match("([^|]*)|([^|]*)|([^|]*)|(.*)")
-			if hash and author and date and message then
-				table.insert(commits, {
-					hash = vim.trim(hash),
-					author = vim.trim(author),
-					date = vim.trim(date),
-					message = vim.trim(message),
-					branch = branch,
+	-- Execute all commands in parallel
+	local full_command = table.concat(commands, " ") .. " wait"
+	os.execute(full_command)
+
+	-- Read results from temp files
+	local batch_results = {}
+	for i, temp_file in ipairs(temp_files) do
+		local repo = repo_batch[i]
+		local commits = {}
+		local seen_hashes = {}
+
+		local file = io.open(temp_file, "r")
+		if file then
+			for line in file:lines() do
+				if line and line ~= "" then
+					local hash, author, date, message, refs = line:match("([^|]*)|([^|]*)|([^|]*)|([^|]*)|?(.*)")
+					if hash and author and date and message then
+						hash = vim.trim(hash)
+						author = vim.trim(author)
+						date = vim.trim(date)
+						message = vim.trim(message)
+						refs = refs and vim.trim(refs) or ""
+
+						if not seen_hashes[hash] and matches_author_filter(author, author_filter) then
+							seen_hashes[hash] = true
+
+							local branch = "main"
+							if refs and refs ~= "" then
+								branch = refs:match("origin/([^,%)]+)") or refs:match("([^,%)]+)") or "main"
+								branch = branch:gsub("^refs/heads/", ""):gsub("^refs/remotes/origin/", "")
+							end
+
+							table.insert(commits, {
+								hash = hash,
+								author = author,
+								date = date,
+								message = message,
+								branch = branch,
+							})
+						end
+					end
+				end
+			end
+			file:close()
+
+			-- Sort commits by date (newest first)
+			table.sort(commits, function(a, b)
+				return a.date > b.date
+			end)
+
+			if #commits > 0 then
+				table.insert(batch_results, {
+					path = repo,
+					commits = commits,
 				})
 			end
 		end
+
+		-- Clean up temp file
+		os.remove(temp_file)
 	end
 
-	return commits
-end
-
-local function get_all_recent_commits(repo_path, days_back, author_filter)
-	local branches = get_local_branches(repo_path)
-	local all_commits = {}
-	if branches == nil then
-		return
-	end
-
-	for _, branch in ipairs(branches) do
-		local commits = get_recent_commits_from_branch(repo_path, branch, days_back)
-		if commits ~= nil then
-			for _, commit in ipairs(commits) do
-				if matches_author_filter(commit.author, author_filter) then
-					table.insert(all_commits, commit)
-				end
-			end
-		end
-	end
-
-	-- Sort commits by date (newest first)
-	table.sort(all_commits, function(a, b)
-		return a.date > b.date
-	end)
-
-	local unique_commits = {}
-	local seen_hashes = {}
-	for _, commit in ipairs(all_commits) do
-		if not seen_hashes[commit.hash] then
-			seen_hashes[commit.hash] = true
-			table.insert(unique_commits, commit)
-		end
-	end
-
-	return unique_commits
+	return batch_results
 end
 
 function M.scan_projects()
-	local repos = find_git_repos(M.config.project_directory, M.config.max_depth)
-	local results = {}
+	local scan_coroutine = find_git_repos_async(M.config.project_directory, M.config.max_depth)
+	local repos = nil
+	local scan_start_time = vim.loop.now()
 
+	while coroutine.status(scan_coroutine) ~= "dead" do
+		local success, result = coroutine.resume(scan_coroutine)
+		if not success then
+			print("Error during directory scanning: " .. tostring(result))
+			print("Falling back to synchronous directory scanning...")
+			repos = find_git_repos(M.config.project_directory, M.config.max_depth)
+			break
+		end
+
+		if result then
+			repos = result
+		end
+
+		-- Show progress during directory scanning
+		if coroutine.status(scan_coroutine) ~= "dead" then
+			vim.cmd("redraw")
+		end
+	end
+
+	local scan_duration = (vim.loop.now() - scan_start_time) / 1000
+
+	if not repos then
+		print("Failed to scan for repositories")
+		return {}
+	end
+
+	local results = {}
 	local filter_info = ""
 	if M.config.filter_author then
 		if M.config.filter_author == "me" then
@@ -209,18 +314,47 @@ function M.scan_projects()
 		end
 	end
 
-	print(string.format("Found %d Git repositories in %s%s", #repos, M.config.project_directory, filter_info))
+	print(string.format("📁 Found %d Git repositories in %.2fs%s", #repos, scan_duration, filter_info))
+	print("🔄 Processing repositories for recent commits in parallel...")
 
-	for _, repo in ipairs(repos) do
-		local commits = get_all_recent_commits(repo, M.config.days_back, M.config.filter_author)
-		if #commits > 0 then
-			table.insert(results, {
-				path = repo,
-				commits = commits,
-			})
+	local git_start_time = vim.loop.now()
+
+	-- Process repositories in truly parallel batches using background processes
+	local parallel_jobs = M.config.parallel_git_jobs
+	local processed_count = 0
+
+	for i = 1, #repos, parallel_jobs do
+		local batch_end = math.min(i + parallel_jobs - 1, #repos)
+		local repo_batch = {}
+
+		-- Collect repos for this batch
+		for j = i, batch_end do
+			table.insert(repo_batch, repos[j])
+		end
+
+		-- Execute git commands in parallel for this batch
+		local batch_results = execute_parallel_git_commands(repo_batch, M.config.days_back, M.config.filter_author)
+
+		-- Add results to main results
+		for _, result in ipairs(batch_results) do
+			table.insert(results, result)
+		end
+
+		processed_count = processed_count + #repo_batch
+
+		-- Progress update and UI refresh
+		if processed_count % 10 == 0 or processed_count == #repos then
+			print(string.format("Processed %d/%d repositories...", processed_count, #repos))
+			vim.cmd("redraw")
 		end
 	end
 
+	local git_duration = (vim.loop.now() - git_start_time) / 1000
+	local total_duration = scan_duration + git_duration
+
+	print(
+		string.format("✅ Completed in %.2fs (scan: %.2fs, git: %.2fs)", total_duration, scan_duration, git_duration)
+	)
 	return results
 end
 
@@ -395,6 +529,52 @@ function M.get_author_filter_info()
 	else
 		return string.format("Filtering by: %s", M.config.filter_author)
 	end
+end
+
+-- Configure directory scanning batch size for performance tuning
+function M.set_directory_batch_size(dir_batch)
+	if dir_batch and dir_batch > 0 then
+		M.config.batch_size_dirs = dir_batch
+		print(string.format("Directory batch size set to: %d", M.config.batch_size_dirs))
+	else
+		print("Current directory batch size: " .. M.config.batch_size_dirs)
+		print("Usage: M.set_directory_batch_size(8)")
+		print("Higher values = faster directory scanning, lower values = more responsive")
+	end
+end
+
+-- Configure maximum commits per repository
+function M.set_max_commits(max_commits)
+	if max_commits and max_commits > 0 then
+		M.config.max_commits_per_repo = max_commits
+		print(string.format("Max commits per repository set to: %d", M.config.max_commits_per_repo))
+	else
+		print("Current max commits per repository: " .. M.config.max_commits_per_repo)
+		print("Usage: M.set_max_commits(200)")
+		print("Lower values = faster git operations, higher values = more complete history")
+	end
+end
+
+-- Configure parallel git jobs
+function M.set_parallel_jobs(jobs)
+	if jobs and jobs > 0 then
+		M.config.parallel_git_jobs = jobs
+		print(string.format("Parallel git jobs set to: %d", M.config.parallel_git_jobs))
+	else
+		print("Current parallel git jobs: " .. M.config.parallel_git_jobs)
+		print("Usage: M.set_parallel_jobs(5)")
+		print("Higher values = faster processing, but may overwhelm system resources")
+	end
+end
+
+-- Get performance statistics
+function M.get_performance_info()
+	return {
+		batch_size_dirs = M.config.batch_size_dirs,
+		max_commits_per_repo = M.config.max_commits_per_repo,
+		parallel_git_jobs = M.config.parallel_git_jobs,
+		parallelization = "Parallel git operations + optimized directory scanning + commit limits",
+	}
 end
 
 return M
