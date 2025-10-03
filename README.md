@@ -173,13 +173,3 @@ Please feel free to submit issues and pull requests.
 ## License
 
 Functional Source License- see LICENSE.md file for details.
-
-## Changelog
-
-### v1.0.0
-- Initial release
-- Basic Git repository scanning
-- Multi-branch commit detection
-- Configurable time ranges and scan depth
-- Syntax highlighting
-- User commands

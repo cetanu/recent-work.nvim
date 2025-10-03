@@ -1,6 +1,3 @@
--- Example Neovim configuration for Recent Work plugin
--- Place this in your init.lua or in a separate config file
-
 -- Basic setup with default configuration
 require("recent-work").setup()
 
@@ -14,6 +11,11 @@ require("recent-work").setup({
 
 	-- Maximum directory depth to scan
 	max_depth = 4,
+
+	-- Performance tuning options
+	batch_size_dirs = 8, -- Directory scanning batch size
+	max_commits_per_repo = 150, -- Limit commits per repo for faster processing
+	parallel_git_jobs = 6, -- Number of parallel Git operations
 
 	-- Additional patterns to ignore when scanning
 	ignore_patterns = {
@@ -128,4 +130,3 @@ vim.api.nvim_create_user_command('RecentWorkTelescope', telescope_recent_work, {
   desc = 'Open Recent Work results in Telescope'
 })
 --]]
-
