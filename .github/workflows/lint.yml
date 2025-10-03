@@ -1,0 +1,35 @@
+name: Lint
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+    branches:
+      - master
+
+jobs:
+  stylua:
+    name: Stylua
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Run Stylua
+        uses: JohnnyMorganz/stylua-action@v3
+        with:
+          version: latest
+          args: --check .
+
+  selene:
+    name: Selene
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Install Selene
+        run: cargo install selene --locked
+      - name: Run Selene
+        run: selene --config selene.toml .
