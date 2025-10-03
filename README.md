@@ -120,22 +120,21 @@ Project Directory: /home/user/projects
 📁 /home/user/projects/my-awesome-project
    5 recent commits:
 
-   🔸 a1b2c3d [main] (2023-12-01)
-      👤 John Doe
-      💬 Fix critical bug in authentication
+   🌿 main - 👤 John Doe
+      a1b2c3d (2023-12-01) Fix critical bug in authentication
+      b2c3d4e (2023-11-29) Improve error handling
 
-   🔸 e4f5g6h [feature/new-ui] (2023-11-30)
-      👤 Jane Smith
-      💬 Add new user interface components
+   🌿 feature/new-ui - 👤 Jane Smith
+      e4f5g6h (2023-11-30) Add new user interface components
+      f5g6h7i (2023-11-28) Update styles for new components
 
 ------------------------------------------------------------
 
 📁 /home/user/projects/another-project
    2 recent commits:
 
-   🔸 i7j8k9l [develop] (2023-12-01)
-      👤 Bob Johnson
-      💬 Update documentation
+   🌿 develop - 👤 Bob Johnson
+      i7j8k9l (2023-12-01) Update documentation
 
 ------------------------------------------------------------
 

@@ -271,10 +271,47 @@ function M.show_results()
 			table.insert(lines, string.format("   %d recent commits:", #result.commits))
 			table.insert(lines, "")
 
+			-- Group commits by branch and author
+			local groups = {}
 			for _, commit in ipairs(result.commits) do
-				table.insert(lines, string.format("   🔸 %s [%s] (%s)", commit.hash, commit.branch, commit.date))
-				table.insert(lines, string.format("      👤 %s", commit.author))
-				table.insert(lines, string.format("      💬 %s", commit.message))
+				local group_key = commit.branch .. "|" .. commit.author
+				if not groups[group_key] then
+					groups[group_key] = {
+						branch = commit.branch,
+						author = commit.author,
+						commits = {},
+					}
+				end
+				table.insert(groups[group_key].commits, commit)
+			end
+
+			local sorted_groups = {}
+			for _, group in pairs(groups) do
+				table.insert(sorted_groups, group)
+			end
+
+			-- Sort by branch, author
+			table.sort(sorted_groups, function(a, b)
+				if a.branch == b.branch then
+					return a.author < b.author
+				end
+				return a.branch < b.branch
+			end)
+
+			-- Display each group
+			for _, group in ipairs(sorted_groups) do
+				-- header
+				table.insert(lines, string.format("   🌿 %s - 👤 %s", group.branch, group.author))
+
+				-- Sort commits (newest first)
+				table.sort(group.commits, function(a, b)
+					return a.date > b.date
+				end)
+
+				for _, commit in ipairs(group.commits) do
+					table.insert(lines, string.format("      %s (%s) %s", commit.hash, commit.date, commit.message))
+				end
+
 				table.insert(lines, "")
 			end
 
@@ -361,4 +398,3 @@ function M.get_author_filter_info()
 end
 
 return M
-
