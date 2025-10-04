@@ -9,27 +9,17 @@ on:
       - master
 
 jobs:
-  stylua:
-    name: Stylua
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-      - name: Run Stylua
-        uses: JohnnyMorganz/stylua-action@v3
-        with:
-          version: latest
-          args: --check .
-
-  selene:
-    name: Selene
+  lint:
+    name: Stylua and Selene
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
-      - name: Install Selene
-        run: cargo install selene --locked
+      - name: Install Tools
+        run: cargo install selene stylua --locked
       - name: Run Selene
-        run: selene --config selene.toml .
+        run: selene lua
+      - name: Run Stylua
+        run: stylua --check lua
