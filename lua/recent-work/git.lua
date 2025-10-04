@@ -1,46 +1,92 @@
--- Git operations for recent-work.nvim
--- Handles Git user detection, commit parsing, and repository scanning
-
 local M = {}
+
+local cached_user = nil
+
+--- Get git config via the OS
+--- @param key string The config to display
+--- @return string Config the git configuration line
+local function gitconfig(key)
+	local handle = io.popen("git config " .. key .. " 2>/dev/null")
+	if not handle then
+		return ""
+	end
+	local result = handle:read("*a") or ""
+	handle:close()
+	return result:gsub("\n", "")
+end
 
 --- Get current Git user information
 --- @return table User information with name and email fields
 function M.get_current_user()
-	local user_name = vim.fn.system("git config --global user.name"):gsub("\n", "")
-	local user_email = vim.fn.system("git config --global user.email"):gsub("\n", "")
-
-	-- Try local config if global is empty
-	if user_name == "" or user_email == "" then
-		user_name = vim.fn.system("git config user.name"):gsub("\n", "")
-		user_email = vim.fn.system("git config user.email"):gsub("\n", "")
+	if cached_user then
+		return cached_user
 	end
 
-	return {
+	local user_name = gitconfig("--global user.name")
+	local user_email = gitconfig("--global user.email")
+
+	if user_name == "" or user_email == "" then
+		user_name = gitconfig("user.name")
+		user_email = gitconfig("user.email")
+	end
+
+	cached_user = {
 		name = user_name ~= "" and user_name or nil,
 		email = user_email ~= "" and user_email or nil,
 	}
+
+	return cached_user
+end
+
+--- Clear the cached user information (useful for testing or when git config changes)
+function M.clear_user_cache()
+	cached_user = nil
 end
 
 --- Check if an author matches the given filter
 --- @param author string Author name/email from commit
---- @param filter string|nil Filter criteria ("me", specific name/email, or nil for all)
+--- @param filter table Resolved filter with type and values
 --- @return boolean Whether the author matches the filter
 function M.matches_author_filter(author, filter)
-	if not filter then
+	if not filter or filter.type == "all" then
 		return true -- Show all authors
+	end
+
+	if filter.type == "me" then
+		if filter.name and author:find(filter.name, 1, true) then
+			return true
+		end
+		if filter.email and author:find(filter.email, 1, true) then
+			return true
+		end
+		return false
+	elseif filter.type == "specific" then
+		return author:lower():find(filter.value:lower(), 1, true) ~= nil
+	end
+
+	return false
+end
+
+--- Resolve author filter to avoid unsafe calls in libuv context
+--- @param filter string|nil Filter criteria ("me", specific name/email, or nil for all)
+--- @return table Resolved filter information
+function M.resolve_author_filter(filter)
+	if not filter then
+		return { type = "all" }
 	end
 
 	if filter == "me" then
 		local user = M.get_current_user()
-		if user.name and author:find(user.name, 1, true) then
-			return true
-		end
-		if user.email and author:find(user.email, 1, true) then
-			return true
-		end
-		return false
+		return {
+			type = "me",
+			name = user.name,
+			email = user.email,
+		}
 	else
-		return author:lower():find(filter:lower(), 1, true) ~= nil
+		return {
+			type = "specific",
+			value = filter,
+		}
 	end
 end
 
@@ -57,12 +103,20 @@ function M.parse_commit_line(line)
 		return nil
 	end
 
+	-- Safe trim function to replace vim.trim
+	local function safe_trim(str)
+		if not str then
+			return ""
+		end
+		return str:match("^%s*(.-)%s*$") or ""
+	end
+
 	-- Clean up fields
-	hash = vim.trim(hash)
-	author = vim.trim(author)
-	date = vim.trim(date)
-	message = vim.trim(message)
-	refs = refs and vim.trim(refs) or ""
+	hash = safe_trim(hash)
+	author = safe_trim(author)
+	date = safe_trim(date)
+	message = safe_trim(message)
+	refs = refs and safe_trim(refs) or ""
 
 	-- Extract branch name from refs
 	local branch = "main"
@@ -93,6 +147,9 @@ function M.execute_parallel_commands(repo_batch, days_back, author_filter, max_c
 	local completed_repos = 0
 	local batch_results = {}
 	local is_async = callback ~= nil
+
+	-- Resolve author upfront to avoid calls in uv context
+	local filter = M.resolve_author_filter(author_filter)
 
 	if total_repos == 0 then
 		if is_async then
@@ -176,11 +233,7 @@ function M.execute_parallel_commands(repo_batch, days_back, author_filter, max_c
 
 				for line in full_output:gmatch("[^\r\n]+") do
 					local commit = M.parse_commit_line(line)
-					if
-						commit
-						and not seen_hashes[commit.hash]
-						and M.matches_author_filter(commit.author, author_filter)
-					then
+					if commit and not seen_hashes[commit.hash] and M.matches_author_filter(commit.author, filter) then
 						seen_hashes[commit.hash] = true
 						table.insert(commits, commit)
 					end
@@ -230,7 +283,8 @@ function M.execute_parallel_commands(repo_batch, days_back, author_filter, max_c
 
 		while completed_repos < total_repos do
 			vim.uv.run("nowait")
-			vim.wait(10) -- prevent busy waiting
+			-- Use uv.sleep instead of vim.wait for safety in fast event context
+			vim.uv.sleep(10)
 
 			-- Check for timeout
 			if vim.uv.hrtime() - start_time > timeout then
