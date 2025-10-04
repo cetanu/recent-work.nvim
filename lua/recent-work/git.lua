@@ -85,81 +85,176 @@ end
 --- @param days_back number Number of days to look back
 --- @param author_filter string|nil Author filter
 --- @param max_commits number Maximum commits per repository
---- @return table Results with commits for each repository
-function M.execute_parallel_commands(repo_batch, days_back, author_filter, max_commits)
+--- @param callback function|nil Optional callback for async execution
+--- @return table|nil Results with commits for each repository
+function M.execute_parallel_commands(repo_batch, days_back, author_filter, max_commits, callback)
 	local since_date = os.date("%Y-%m-%d", os.time() - (days_back * 24 * 60 * 60))
-	local temp_files = {}
-	local commands = {}
+	local total_repos = #repo_batch
+	local completed_repos = 0
+	local batch_results = {}
+	local is_async = callback ~= nil
 
-	-- Create temporary files and commands for each repository
-	for _, repo in ipairs(repo_batch) do
-		local temp_file = vim.fn.tempname()
-		table.insert(temp_files, temp_file)
-
-		local git_cmd = string.format(
-			"cd '%s' && git log --all --since='%s' --max-count=%d --pretty=format:'%%h|%%an|%%ad|%%s|%%D' --date=short > '%s' 2>/dev/null &",
-			repo,
-			since_date,
-			max_commits,
-			temp_file
-		)
-		table.insert(commands, git_cmd)
+	if total_repos == 0 then
+		if is_async then
+			vim.schedule(function()
+				callback({})
+			end)
+			return
+		else
+			return {}
+		end
 	end
 
-	-- Execute all commands in parallel
-	local full_command = table.concat(commands, " ") .. " wait"
-	os.execute(full_command)
+	local repo_states = {}
 
-	-- Process results from temporary files
-	return M.process_batch_results(repo_batch, temp_files, author_filter)
-end
+	local function complete_repo(repo_index, success, commits)
+		local state = repo_states[repo_index]
+		if state.completed then
+			return
+		end
+		state.completed = true
+		completed_repos = completed_repos + 1
 
---- Process results from temporary files after parallel Git execution
---- @param repo_batch table List of repository paths
---- @param temp_files table List of temporary file paths
---- @param author_filter string|nil Author filter
---- @return table Processed results with commits for each repository
-function M.process_batch_results(repo_batch, temp_files, author_filter)
-	local batch_results = {}
+		-- Cleanup resources
+		if state.stdout_pipe and not vim.uv.is_closing(state.stdout_pipe) then
+			vim.uv.close(state.stdout_pipe)
+		end
+		if state.stderr_pipe and not vim.uv.is_closing(state.stderr_pipe) then
+			vim.uv.close(state.stderr_pipe)
+		end
+		if state.handle and not vim.uv.is_closing(state.handle) then
+			vim.uv.close(state.handle)
+		end
 
-	for i, temp_file in ipairs(temp_files) do
-		local repo = repo_batch[i]
-		local commits = {}
-		local seen_hashes = {}
+		if success and commits and #commits > 0 then
+			table.insert(batch_results, {
+				path = repo_batch[repo_index],
+				commits = commits,
+			})
+		end
 
-		local file = io.open(temp_file, "r")
-		if file then
-			for line in file:lines() do
-				local commit = M.parse_commit_line(line)
-				if
-					commit
-					and not seen_hashes[commit.hash]
-					and M.matches_author_filter(commit.author, author_filter)
-				then
-					seen_hashes[commit.hash] = true
-					table.insert(commits, commit)
-				end
+		if completed_repos == total_repos then
+			if is_async then
+				vim.schedule(function()
+					callback(batch_results)
+				end)
 			end
-			file:close()
+		end
+	end
 
-			-- Sort commits by date (newest first)
-			table.sort(commits, function(a, b)
-				return a.date > b.date
+	-- Process each repository
+	for i, repo in ipairs(repo_batch) do
+		local state = {
+			repo = repo,
+			stdout_data = {},
+			stderr_data = {},
+			stdout_pipe = vim.uv.new_pipe(),
+			stderr_pipe = vim.uv.new_pipe(),
+			handle = nil,
+			completed = false,
+		}
+		repo_states[i] = state
+
+		local git_args = {
+			"log",
+			"--all",
+			"--since=" .. since_date,
+			"--max-count=" .. max_commits,
+			"--pretty=format:%h|%an|%ad|%s|%D",
+			"--date=short",
+		}
+
+		state.handle, _ = vim.uv.spawn("git", {
+			args = git_args,
+			cwd = repo,
+			stdio = { nil, state.stdout_pipe, state.stderr_pipe },
+		}, function(code, _)
+			if code == 0 then
+				local commits = {}
+				local seen_hashes = {}
+				local full_output = table.concat(state.stdout_data, "")
+
+				for line in full_output:gmatch("[^\r\n]+") do
+					local commit = M.parse_commit_line(line)
+					if
+						commit
+						and not seen_hashes[commit.hash]
+						and M.matches_author_filter(commit.author, author_filter)
+					then
+						seen_hashes[commit.hash] = true
+						table.insert(commits, commit)
+					end
+				end
+
+				-- Sort commits by date (newest first)
+				table.sort(commits, function(a, b)
+					return a.date > b.date
+				end)
+
+				complete_repo(i, true, commits)
+			else
+				-- Git command failed
+				complete_repo(i, false, nil)
+			end
+		end)
+
+		if state.handle then
+			vim.uv.read_start(state.stdout_pipe, function(err, data)
+				if err then
+					complete_repo(i, false, nil)
+				elseif data then
+					table.insert(state.stdout_data, data)
+				else
+					vim.uv.close(state.stdout_pipe)
+				end
 			end)
 
-			if #commits > 0 then
-				table.insert(batch_results, {
-					path = repo,
-					commits = commits,
-				})
+			vim.uv.read_start(state.stderr_pipe, function(err, data)
+				if err then
+					complete_repo(i, false, nil)
+				elseif data then
+					table.insert(state.stderr_data, data)
+				else
+					vim.uv.close(state.stderr_pipe)
+				end
+			end)
+		else
+			-- Failed to spawn process
+			complete_repo(i, false, nil)
+		end
+	end
+
+	if not is_async then
+		local start_time = vim.uv.hrtime()
+		local timeout = 30000000000 -- 30 seconds
+
+		while completed_repos < total_repos do
+			vim.uv.run("nowait")
+			vim.wait(10) -- prevent busy waiting
+
+			-- Check for timeout
+			if vim.uv.hrtime() - start_time > timeout then
+				-- Cleanup processes
+				for _, state in ipairs(repo_states) do
+					if not state.completed then
+						if state.handle and not vim.uv.is_closing(state.handle) then
+							vim.uv.process_kill(state.handle, "sigterm")
+							vim.uv.close(state.handle)
+						end
+						if state.stdout_pipe and not vim.uv.is_closing(state.stdout_pipe) then
+							vim.uv.close(state.stdout_pipe)
+						end
+						if state.stderr_pipe and not vim.uv.is_closing(state.stderr_pipe) then
+							vim.uv.close(state.stderr_pipe)
+						end
+					end
+				end
+				break
 			end
 		end
 
-		-- Clean up temporary file
-		os.remove(temp_file)
+		return batch_results
 	end
-
-	return batch_results
 end
 
 return M
